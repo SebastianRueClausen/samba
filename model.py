@@ -21,6 +21,13 @@ class ModelConfig:
     layer_count: int
     device: str
 
+    def state_dict(self) -> dict:
+        return vars(self)
+
+    def load_state_dict(self, dict: dict):
+        for k,v in dict.items():
+            setattr(self, k, v)
+
 
 def select_device() -> str:
     device = 'cpu'
@@ -207,12 +214,22 @@ class PianoGpt(nn.Module):
 
 
 class Trainer:
-    def __init__(self, model: PianoGpt, data_folder: str):
+    def __init__(
+        self,
+        model: PianoGpt,
+        data_folder: str,
+        checkpoint_path: str = "checkpoint.pth",
+        checkpoint_freq: int = 50,
+    ):
         self.model = model
         self.config = model.config
 
+        self.iteration = 0
         self.optimizer = optim.AdamW(model.parameters(), lr=4e-4)
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, patience=5)
+
+        self.checkpoint_path = checkpoint_path
+        self.checkpoint_freq = checkpoint_freq
 
         train_data_loader = dataset.data_loader(
             folder=data_folder,
@@ -269,28 +286,52 @@ class Trainer:
 
         print(f"loss: {split_loss}")
 
-    def train(self):
-        iteration = 0
+    def save_checkpoint(self):
+        checkpoint = {
+            "model": self.model.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "config": self.model.config.state_dict(),
+            "iteration": self.iteration,
+        }
 
+        torch.save(checkpoint, self.checkpoint_path)
+
+    def load_checkpoint(self):
+        try:
+            checkpoint = torch.load(self.checkpoint_path)
+        except Exception as ex:
+            print(f"failed to load checkpoint: {ex}")
+            return
+
+        self.model.config.load_state_dict(checkpoint["config"])
+        self.model.load_state_dict(checkpoint["model"])
+        self.optimizer.load_state_dict(checkpoint["optimizer"])
+        self.iteration =  checkpoint["iteration"]
+
+    def train(self):
         while True:
-            if iteration % 100 == 0 and iteration != 0:
+            if self.iteration % self.checkpoint_freq == 0 and self.iteration != 0:
                 self.validate_step()
+                self.save_checkpoint()
+
             self.train_step()
 
-            print(f'itertaion: {iteration}')
-            iteration += 1
+            print(f'itertaion: {self.iteration}')
+            self.iteration += 1
 
 
-model = PianoGpt(ModelConfig(
-    vocab_size = vocab.VOCAB_SIZE,
-    dropout_chance = 0.1,
-    context_size = 512 // 2,
-    embedded_size = 768 // 2,
-    head_count = 4,
-    layer_count = 4,
-    batch_size = 64,
-    device = select_device(),
-))
+if __name__ == "__main__":
+    model = PianoGpt(ModelConfig(
+        vocab_size = vocab.VOCAB_SIZE,
+        dropout_chance = 0.1,
+        context_size = 512 // 2,
+        embedded_size = 768 // 2,
+        head_count = 4,
+        layer_count = 4,
+        batch_size = 32,
+        device = select_device(),
+    ))
 
-trainer = Trainer(model, data_folder='maestro-v3.0.0')
-trainer.train()
+    trainer = Trainer(model, data_folder='maestro-v3.0.0')
+    trainer.load_checkpoint()
+    trainer.train()
