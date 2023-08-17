@@ -3,8 +3,9 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.backends.mps
-from torch import optim, Tensor
+from torch import optim, LongTensor, Tensor
 from torch.utils.data import Dataset
+import tqdm
 
 import vocab
 import dataset
@@ -13,7 +14,7 @@ import dataset
 @dataclass
 class ModelConfig:
     vocab_size: int
-    dropout_chance: float
+    dropout_rate: float
     context_size: int
     embedded_size: int
     batch_size: int
@@ -51,8 +52,8 @@ class Head(nn.Module):
         self.query = nn.Linear(config.embedded_size, head_size, bias=False)
         self.value = nn.Linear(config.embedded_size, head_size, bias=False)
 
-        self.dropout = nn.Dropout(config.dropout_chance)
-        self.dropout_chance = config.dropout_chance
+        self.dropout = nn.Dropout(config.dropout_rate)
+        self.dropout_rate = config.dropout_rate
 
         self.use_flash_attention = hasattr(nn.functional, 'scaled_dot_product_attention')
 
@@ -65,7 +66,7 @@ class Head(nn.Module):
             key=self.key(x),
             value=self.value(x),
             attn_mask=None,
-            dropout_p=self.dropout_chance if self.training else 0.0,
+            dropout_p=self.dropout_rate if self.training else 0.0,
             is_causal=True,
         )
 
@@ -111,7 +112,7 @@ class MultiHead(nn.Module):
         super().__init__()
 
         self.projection = nn.Linear(head_size * config.head_count, config.embedded_size)
-        self.dropout = nn.Dropout(config.dropout_chance)
+        self.dropout = nn.Dropout(config.dropout_rate)
         self.heads = nn.ModuleList([Head(config, head_size) for _ in range(config.head_count)])
 
     def forward(self, x: Tensor) -> Tensor:
@@ -121,14 +122,16 @@ class MultiHead(nn.Module):
 
 
 class FeedForward(nn.Module):
-    def __init__(self, dropout_chance: float, embedded_size: int):
+    def __init__(self, dropout_rate: float, embedded_size: int):
         super().__init__()
 
+        hidden_size = 4 * embedded_size
+
         self.net = nn.Sequential(
-            nn.Linear(embedded_size, 4 * embedded_size, bias=False),
+            nn.Linear(embedded_size, hidden_size, bias=False),
             nn.ReLU(),
-            nn.Linear(4 * embedded_size, embedded_size, bias=False),
-            nn.Dropout(dropout_chance),
+            nn.Linear(hidden_size, embedded_size, bias=False),
+            nn.Dropout(dropout_rate),
         )
 
     def forward(self, x):
@@ -142,7 +145,7 @@ class Block(nn.Module):
         head_size = config.embedded_size // config.head_count
 
         self.self_attention = MultiHead(config, head_size)
-        self.feed_forward = FeedForward(config.dropout_chance, config.embedded_size)
+        self.feed_forward = FeedForward(config.dropout_rate, config.embedded_size)
         self.layer_norm1 = nn.LayerNorm(config.embedded_size)
         self.layer_norm2 = nn.LayerNorm(config.embedded_size)
 
@@ -172,11 +175,11 @@ class PianoGpt(nn.Module):
 
     def init_weights_apply(self, module: nn.Module):
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
+                nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def init_weights(self):
         self.apply(self.init_weights_apply)
@@ -202,14 +205,22 @@ class PianoGpt(nn.Module):
 
         return logits, loss
 
+    @torch.no_grad()
     def generate(self, context: Tensor, new_token_count: int) -> Tensor:
+        self.eval()
+
         for _ in range(new_token_count):
             input = context[:, -self.config.context_size:]
+
             logits, loss = self(input, None)
             logits = logits[:, -1, :]
+
+            logits[logits < torch.topk(logits, 5)[0][..., -1, None]] = -float('Inf')
             probs = nn.functional.softmax(logits, dim=-1)
-            next = torch.multinomial(probs, num_samples=1)
-            context = torch.cat((context, next), dim=1)
+            
+            next_token = torch.multinomial(probs, num_samples=1)
+            context = torch.cat((context, next_token), dim=1)
+
         return context
 
 
@@ -219,17 +230,33 @@ class Trainer:
         model: PianoGpt,
         data_folder: str,
         checkpoint_path: str = "checkpoint.pth",
-        checkpoint_freq: int = 50,
+        checkpoint_freq: int = 500,
+        iteration_count: int = 16000,
     ):
         self.model = model
         self.config = model.config
 
         self.iteration = 0
-        self.optimizer = optim.AdamW(model.parameters(), lr=4e-4)
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, patience=5)
+        self.iteration_count = iteration_count
+
+        self.max_learning_rate = 1e-4
+        self.min_learning_rate = 1e-8
+
+        self.optimizer = optim.AdamW(model.parameters(), lr=self.max_learning_rate)
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer,
+            T_max=iteration_count,
+            eta_min=self.min_learning_rate,
+        );
+
+        self.scaler = torch.cuda.amp.GradScaler()
+
+        self.grad_accum_steps = 8
 
         self.checkpoint_path = checkpoint_path
         self.checkpoint_freq = checkpoint_freq
+
+        self.autocast = torch.amp.autocast(device_type=model.config.device, dtype=torch.float16)
 
         train_data_loader = dataset.data_loader(
             folder=data_folder,
@@ -254,19 +281,24 @@ class Trainer:
         x, y = next(self.train_data_iter)
         x, y = x.to(self.config.device), y.to(self.config.device)
 
-        logits, loss = model(x, y)
-        self.optimizer.zero_grad(set_to_none=True)
+        with self.autocast:
+            logits, loss = model(x, y)
+            loss /= self.grad_accum_steps
 
-        loss.backward()
+        self.scaler.scale(loss).backward()
 
-        self.optimizer.step()
-        self.scheduler.step(loss)
+        if not self.iteration % self.grad_accum_steps:
+            self.scaler.step(self.optimizer)
+            self.scheduler.step()
+            self.scaler.update()
+            self.optimizer.zero_grad(set_to_none=True)
+
 
     @torch.no_grad()
     def validate_step(self):
         self.model.eval()
 
-        iterations = 50
+        iterations = 100
         split_loss = {}
 
         for split, data_iter in [
@@ -278,11 +310,13 @@ class Trainer:
             for k in range(iterations):
                 x, y = next(data_iter)
                 x, y = x.to(self.config.device), y.to(self.config.device)
-
-                logits, loss = self.model(x, y)
+                
+                with self.autocast:
+                    logits, loss = self.model(x, y)
+                
                 losses[k] = loss.item()
 
-                split_loss[split] = losses.mean()
+            split_loss[split] = losses.mean()
 
         print(f"loss: {split_loss}")
 
@@ -290,6 +324,7 @@ class Trainer:
         checkpoint = {
             "model": self.model.state_dict(),
             "optimizer": self.optimizer.state_dict(),
+            "scheduler": self.scheduler.state_dict(),
             "config": self.model.config.state_dict(),
             "iteration": self.iteration,
         }
@@ -303,35 +338,65 @@ class Trainer:
             print(f"failed to load checkpoint: {ex}")
             return
 
-        self.model.config.load_state_dict(checkpoint["config"])
         self.model.load_state_dict(checkpoint["model"])
-        self.optimizer.load_state_dict(checkpoint["optimizer"])
-        self.iteration =  checkpoint["iteration"]
+        self.model.config.load_state_dict(checkpoint["config"])
+        # self.optimizer.load_state_dict(checkpoint["optimizer"])
+        # self.scheduler.load_state_dict(checkpoint["scheduler"])
+        # self.iteration =  checkpoint["iteration"]
 
     def train(self):
-        while True:
-            if self.iteration % self.checkpoint_freq == 0 and self.iteration != 0:
+        bar = tqdm.tqdm(total=self.iteration_count)
+        bar.update(self.iteration)
+
+        while self.iteration_count > self.iteration:
+            if self.iteration % self.checkpoint_freq == 0:
                 self.validate_step()
-                self.save_checkpoint()
+
+                if self.iteration != 0:
+                    self.save_checkpoint()
 
             self.train_step()
-
-            print(f'itertaion: {self.iteration}')
             self.iteration += 1
+            bar.update(1)
+
+        self.save_checkpoint()
+        bar.close()
 
 
 if __name__ == "__main__":
+    torch.manual_seed(1337)
+
+    train = False
+
     model = PianoGpt(ModelConfig(
         vocab_size = vocab.VOCAB_SIZE,
-        dropout_chance = 0.1,
-        context_size = 512 // 2,
-        embedded_size = 768 // 2,
-        head_count = 4,
-        layer_count = 4,
-        batch_size = 32,
+        dropout_rate = 0.1,
+        context_size = 512,
+        embedded_size = 768,
+        head_count = 8,
+        layer_count = 8,
+        batch_size = 16,
         device = select_device(),
     ))
 
+    model = torch.compile(model)
     trainer = Trainer(model, data_folder='maestro-v3.0.0')
     trainer.load_checkpoint()
-    trainer.train()
+
+    if train:
+        trainer.train()
+
+        for index in range(8):
+            context = torch.zeros((1, 1), dtype=torch.long, device=model.config.device)
+            tokens = model.generate(context, new_token_count=1024*2)
+            tokens = tokens.squeeze()
+            vocab.tokens_to_midi(f"samples/sample_{index}.midi", tokens) 
+    else:
+        for index in range(8):
+            context = torch.zeros((1, 1), dtype=torch.long, device=model.config.device)
+            tokens = model.generate(context, new_token_count=1024 * 4)
+            tokens = tokens.squeeze()
+
+            vocab.tokens_to_midi(f"samples/sample_{index + 24}.midi", tokens) 
+            vocab.tokens_to_midi("out.midi", tokens) 
+

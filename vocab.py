@@ -8,7 +8,7 @@ Token = int
 
 SUBDIVISIONS = 64
 
-META_TOKEN_COUNT = 2
+META_TOKEN_COUNT = 1
 ADVANCE_TOKEN_COUNT = int(math.log2(SUBDIVISIONS)) + 1
 VELOCITY_TOKEN_COUNT = 16
 KEY_ON_TOKEN_COUNT = 88
@@ -23,7 +23,7 @@ PEDAL_TOKEN_START = KEY_OFF_TOKEN_START + KEY_OFF_TOKEN_COUNT
 
 VOCAB_SIZE = PEDAL_TOKEN_START + PEDAL_TOKEN_COUNT
 
-TOKEN_NAMES = ['<pad>', '<next_track>'] \
+TOKEN_NAMES = ['<next_track>'] \
     + [f'advance_{pow(2, i)}' for i in range(ADVANCE_TOKEN_COUNT)] \
     + [f'velocity_{i}' for i in range(VELOCITY_TOKEN_COUNT)] \
     + [f'key_on_{i}' for i in range(KEY_ON_TOKEN_COUNT)] \
@@ -101,11 +101,14 @@ class ParseState:
             self.pedal = pedal
 
 
-def midi_to_tokens(file_path: str) -> LongTensor:
+def midi_to_tokens(file_path: str, transpose: int = 0) -> LongTensor:
     """ Load a midi file and convert it to a tensor of tokens. """
 
     midi = mido.MidiFile(file_path)
     state = ParseState(ticks_per_step=midi.ticks_per_beat // (SUBDIVISIONS // 4))
+
+    min_key = 0
+    max_key = 87
 
     for track in midi.tracks:
         time_delta = 0
@@ -119,6 +122,10 @@ def midi_to_tokens(file_path: str) -> LongTensor:
             match event.type:
                 case 'note_on':
                     key = midi_note_to_key(event.note)
+                
+                    min_key = min(key, min_key)
+                    max_key = max(key, max_key)
+
                     if event.velocity == 0:
                         state.advance_ticks(time_delta, key); time_delta = 0
                         state.key_off(key)
@@ -134,6 +141,15 @@ def midi_to_tokens(file_path: str) -> LongTensor:
                     state.set_pedal(True if event.value >= 64 else False)
                 case _:
                     continue
+    
+    transpose = max(transpose, -min_key)
+    transpose = min(transpose, 87 - max_key)
+
+    if transpose != 0:
+        print(f"transposing by {transpose}")
+        for token in state.tokens:
+            if token in range(KEY_ON_TOKEN_START, PEDAL_TOKEN_START):
+                token += transpose
 
     return LongTensor(state.tokens)
 
@@ -168,15 +184,18 @@ def tokens_to_midi(file_path: str, tokens: LongTensor):
     velocity = 0
 
     for token in tokens.tolist():
-        if token < VELOCITY_TOKEN_START and token >= ADVANCE_TOKEN_START:
+        if token < ADVANCE_TOKEN_START:
+            continue
+        if token < VELOCITY_TOKEN_START:
             time += pow(2, token - ADVANCE_TOKEN_START) \
                 * (midi.ticks_per_beat // (SUBDIVISIONS // 4))
         elif token < KEY_ON_TOKEN_START:
             velocity = velocity_to_midi_velocity(token - VELOCITY_TOKEN_START)
         elif token < KEY_OFF_TOKEN_START:
+            note = key_to_midi_note(token - KEY_ON_TOKEN_START)
             track.append(mido.Message(
                 type='note_on',
-                note=key_to_midi_note(token - KEY_ON_TOKEN_START),
+                note=note,
                 velocity=velocity,
                 time=time - last_event_time,
             ))
@@ -199,5 +218,6 @@ def tokens_to_midi(file_path: str, tokens: LongTensor):
     midi.save(file_path)
 
 if __name__ == "__main__":
-    tokens = midi_to_tokens('maestro-v3.0.0/2008/MIDI-Unprocessed_07_R1_2008_01-04_ORIG_MID--AUDIO_07_R1_2008_wav--1.midi')
+    path = 'maestro-v3.0.0/2008/MIDI-Unprocessed_07_R1_2008_01-04_ORIG_MID--AUDIO_07_R1_2008_wav--1.midi'
+    tokens = midi_to_tokens(path, -2)
     tokens_to_midi('out.midi', tokens)

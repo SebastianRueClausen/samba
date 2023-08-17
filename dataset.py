@@ -23,13 +23,14 @@ class Dataset(torch.utils.data.IterableDataset):
         split_offset = len(files) * (0.9 if self.split == 'train' else 0.1)
         split_files = files[:int(split_offset)]
 
-        rng = random.Random()
+        rng = random.Random(1337)
 
         while True:
             rng.shuffle(split_files)
 
             for file in split_files:
-                tokens = vocab.midi_to_tokens(file)
+                transpose = random.randint(-12, 12)
+                tokens = vocab.midi_to_tokens(file, transpose)
 
                 if len(tokens) < self.context_size:
                     continue
