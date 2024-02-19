@@ -3,17 +3,17 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.backends.mps
-from torch import optim, LongTensor, Tensor
-from torch.utils.data import Dataset
+from torch import optim, Tensor
 import tqdm
 
-import vocab
-import dataset
+#from mamba_ssm import Mamba
 
+import simple_vocab
+import dataset
 
 @dataclass
 class ModelConfig:
-    vocab_size: int
+    vocab_sizes: list[int]
     dropout_rate: float
     context_size: int
     embedded_size: int
@@ -39,12 +39,49 @@ def select_device() -> str:
     return device
 
 
-class Head(nn.Module):
-    """
-        A single attention head, a direct implementation of Scaled dot-product
-        attention from (Ashish Vaswani et. al. 2017).
-    """
+class FeedForward(nn.Module):
+    def __init__(self, dropout_rate: float, embedded_size: int):
+        super().__init__()
 
+        hidden_size = 4 * embedded_size
+
+        self.net = nn.Sequential(
+            nn.Linear(embedded_size, hidden_size, bias=False),
+            nn.ReLU(),
+            nn.Linear(hidden_size, embedded_size, bias=False),
+            nn.Dropout(dropout_rate),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+"""
+class MambaBlock(nn.Module):
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+
+        self.mamba = Mamba(
+            d_model=config.embedded_size,
+            d_state=16,
+            d_conv=4,
+            expand=2,
+            use_fast_path=True,
+            device=config.device,
+        )
+
+        self.feed_forward = FeedForward(0.0, config.embedded_size)
+        self.layer_norm1 = nn.LayerNorm(config.embedded_size)
+        self.layer_norm2 = nn.LayerNorm(config.embedded_size)
+
+
+    def forward(self, x):
+        print(x.shape)
+        x = x + self.mamba(self.layer_norm1(x))
+        x = x + self.feed_forward(self.layer_norm2(x))
+        return x
+"""
+
+class Head(nn.Module):
     def __init__(self, config: ModelConfig, head_size: int):
         super().__init__()
 
@@ -121,22 +158,6 @@ class MultiHead(nn.Module):
         return out
 
 
-class FeedForward(nn.Module):
-    def __init__(self, dropout_rate: float, embedded_size: int):
-        super().__init__()
-
-        hidden_size = 4 * embedded_size
-
-        self.net = nn.Sequential(
-            nn.Linear(embedded_size, hidden_size, bias=False),
-            nn.ReLU(),
-            nn.Linear(hidden_size, embedded_size, bias=False),
-            nn.Dropout(dropout_rate),
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
 
 class Block(nn.Module):
     def __init__(self, config: ModelConfig):
@@ -155,18 +176,21 @@ class Block(nn.Module):
         return x
 
 
-class PianoGpt(nn.Module):
-    """ An almost exact implementation of a transformer from (Ashish Vaswani et. al. 2017). """
-
+class Samba(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
 
-        self.token_embedding = nn.Embedding(config.vocab_size, config.embedded_size)
         self.position_embedding = nn.Embedding(config.context_size, config.embedded_size)
+        self.token_embeddings = nn.ModuleList([
+            nn.Embedding(size, config.embedded_size) for size in config.vocab_sizes
+        ])
+
         self.blocks = nn.Sequential(*[Block(config) for _ in range(config.layer_count)])
 
         self.linear_norm = nn.LayerNorm(config.embedded_size)
-        self.linear = nn.Linear(config.embedded_size, config.vocab_size)
+        self.linear = nn.ModuleList([
+            nn.Linear(config.embedded_size, size) for size in config.vocab_sizes
+        ])
 
         self.config = config
         self.to(config.device)
@@ -184,24 +208,29 @@ class PianoGpt(nn.Module):
     def init_weights(self):
         self.apply(self.init_weights_apply)
 
-    def forward(self, x: Tensor, y: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
-        batch_size, time_step = x.shape
+    def forward(self, x: Tensor, y: Tensor | None = None) -> tuple[list[Tensor], Tensor | None]:
+        batch_size, time_step, _ = x.shape
 
-        embedded_tokens = self.token_embedding(x)
-        embedded_positions = self.position_embedding(torch.arange(time_step, device=self.config.device))
-        embedded = embedded_tokens + embedded_positions
+        embedded = self.position_embedding(torch.arange(time_step, device=self.config.device))
+        for i, embedder in enumerate(self.token_embeddings):
+            embedded = embedded + embedder(x[:, :, i])
 
-        logits = self.linear(self.linear_norm(self.blocks(embedded)))
+        norm = self.linear_norm(self.blocks(embedded))
+        logits = [linear(norm) for linear in self.linear]
 
         if y is None:
             loss = None
         else:
-            batch_size, time_step, context_size = logits.shape
+            loss = 0
 
-            logits = logits.view(batch_size * time_step, context_size)
-            targets = y.view(batch_size * time_step)
+            for vocab_index, logit in enumerate(logits):
+                batch_size, time_step, vocab_size = logit.shape
 
-            loss = nn.functional.cross_entropy(logits, targets)
+                targets = y[:, :, vocab_index]
+                logit = logit.view(batch_size * time_step, vocab_size)
+                targets = targets.reshape(batch_size * time_step)
+
+                loss = loss + nn.functional.cross_entropy(logit, targets)
 
         return logits, loss
 
@@ -212,14 +241,18 @@ class PianoGpt(nn.Module):
         for _ in range(new_token_count):
             input = context[:, -self.config.context_size:]
 
-            logits, loss = self(input, None)
-            logits = logits[:, -1, :]
+            logits, _ = self(input, None)
 
-            logits[logits < torch.topk(logits, 5)[0][..., -1, None]] = -float('Inf')
-            probs = nn.functional.softmax(logits, dim=-1)
-            
-            next_token = torch.multinomial(probs, num_samples=1)
-            context = torch.cat((context, next_token), dim=1)
+            token_indices = []
+
+            for logit in logits:
+                logit = logit[:, -1, :]
+                logit[logit < torch.topk(logit, 5)[0][..., -1, None]] = -float('Inf')
+                probs = nn.functional.softmax(logit, dim=-1)
+                token_indices.append(torch.multinomial(probs, num_samples=1))
+
+            tokens = torch.tensor(token_indices).unsqueeze(0).unsqueeze(0).to(context.device)
+            context = torch.cat((context, tokens), dim=1)
 
         return context
 
@@ -227,7 +260,7 @@ class PianoGpt(nn.Module):
 class Trainer:
     def __init__(
         self,
-        model: PianoGpt,
+        model: Samba,
         data_folder: str,
         checkpoint_path: str = "checkpoint.pth",
         checkpoint_freq: int = 500,
@@ -241,8 +274,10 @@ class Trainer:
 
         self.max_learning_rate = 1e-4
         self.min_learning_rate = 1e-8
+        self.weight_decay = 1e-1
+        self.grad_clip = 1.0
 
-        self.optimizer = optim.AdamW(model.parameters(), lr=self.max_learning_rate)
+        self.optimizer = optim.AdamW(model.parameters(), lr=self.max_learning_rate, weight_decay=self.weight_decay)
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer,
             T_max=iteration_count,
@@ -282,12 +317,16 @@ class Trainer:
         x, y = x.to(self.config.device), y.to(self.config.device)
 
         with self.autocast:
-            logits, loss = model(x, y)
+            _, loss = model(x, y)
             loss /= self.grad_accum_steps
 
         self.scaler.scale(loss).backward()
 
-        if not self.iteration % self.grad_accum_steps:
+        if self.iteration % self.grad_accum_steps == 0:
+            if self.grad_clip != 0.0:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+
             self.scaler.step(self.optimizer)
             self.scheduler.step()
             self.scaler.update()
@@ -310,10 +349,10 @@ class Trainer:
             for k in range(iterations):
                 x, y = next(data_iter)
                 x, y = x.to(self.config.device), y.to(self.config.device)
-                
+
                 with self.autocast:
-                    logits, loss = self.model(x, y)
-                
+                    _, loss = self.model(x, y)
+
                 losses[k] = loss.item()
 
             split_loss[split] = losses.mean()
@@ -340,9 +379,9 @@ class Trainer:
 
         self.model.load_state_dict(checkpoint["model"])
         self.model.config.load_state_dict(checkpoint["config"])
-        # self.optimizer.load_state_dict(checkpoint["optimizer"])
-        # self.scheduler.load_state_dict(checkpoint["scheduler"])
-        # self.iteration =  checkpoint["iteration"]
+        self.optimizer.load_state_dict(checkpoint["optimizer"])
+        self.scheduler.load_state_dict(checkpoint["scheduler"])
+        self.iteration = checkpoint["iteration"]
 
     def train(self):
         bar = tqdm.tqdm(total=self.iteration_count)
@@ -366,22 +405,27 @@ class Trainer:
 if __name__ == "__main__":
     torch.manual_seed(1337)
 
-    train = False
+    train = True
 
-    model = PianoGpt(ModelConfig(
-        vocab_size = vocab.VOCAB_SIZE,
+    model = Samba(ModelConfig(
+        vocab_sizes = [
+            simple_vocab.PITCH_COUNT,
+            simple_vocab.VELOCITY_COUNT,
+            simple_vocab.ADVANCE_COUNT,
+            simple_vocab.DURATION_COUNT,
+        ],
         dropout_rate = 0.1,
-        context_size = 512,
-        embedded_size = 768,
-        head_count = 8,
-        layer_count = 8,
-        batch_size = 16,
+        context_size = 512 // 2,
+        embedded_size = 768 // 2,
+        head_count = 6,
+        layer_count = 6,
+        batch_size = 32,
         device = select_device(),
     ))
 
     model = torch.compile(model)
     trainer = Trainer(model, data_folder='maestro-v3.0.0')
-    trainer.load_checkpoint()
+    #trainer.load_checkpoint()
 
     if train:
         trainer.train()
@@ -389,14 +433,14 @@ if __name__ == "__main__":
         for index in range(8):
             context = torch.zeros((1, 1), dtype=torch.long, device=model.config.device)
             tokens = model.generate(context, new_token_count=1024*2)
-            tokens = tokens.squeeze()
-            vocab.tokens_to_midi(f"samples/sample_{index}.midi", tokens) 
+            tokens = tokens.squeeze().cpu().numpy()
+            simple_vocab.tokens_to_midi(f"samples/sample_{index}.midi", tokens)
     else:
         for index in range(8):
             context = torch.zeros((1, 1), dtype=torch.long, device=model.config.device)
             tokens = model.generate(context, new_token_count=1024 * 4)
-            tokens = tokens.squeeze()
+            tokens = tokens.squeeze().cpu().numpy()
 
-            vocab.tokens_to_midi(f"samples/sample_{index + 24}.midi", tokens) 
-            vocab.tokens_to_midi("out.midi", tokens) 
+            simple_vocab.tokens_to_midi(f"samples/sample_{index + 24}.midi", tokens)
+            simple_vocab.tokens_to_midi("out.midi", tokens)
 
