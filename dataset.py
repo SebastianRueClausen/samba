@@ -4,7 +4,7 @@ import random
 
 import torch.utils.data
 
-import simple_vocab
+import vocab
 
 
 class Dataset(torch.utils.data.IterableDataset):
@@ -29,9 +29,8 @@ class Dataset(torch.utils.data.IterableDataset):
             rng.shuffle(split_files)
 
             for file in split_files:
-                #transpose = random.randint(-12, 12)
-                transpose = 0
-                tokens = simple_vocab.midi_to_tokens(file, transpose)
+                transpose = random.randint(-3, 3)
+                tokens = vocab.midi_to_tokens(file, transpose)
 
                 if len(tokens) < self.context_size:
                     continue

@@ -1,164 +1,142 @@
 from dataclasses import dataclass
-import math
+import numpy as np
 
-from torch import LongTensor
 import mido
 
-Token = int
+# The vocabulary of samba. The tokens are made to only represent piano.
+# Each token is one key press.
+# 
+# There are four parts to a token:
+#   * Pitch.
+#   * Velocity
+#   * Advance (the number of steps since last key press).
+#   * Duration.
+#
+# The notes are quantized into steps, which is some fraction of a whole note.
 
+# The number of subdivisions of a whole note.
 SUBDIVISIONS = 64
+# The number of possible pitches.
+PITCH_COUNT = 88
+# The number of different key velocities.
+VELOCITY_COUNT = 16
+# The number of possible steps since last key press.
+ADVANCE_COUNT = SUBDIVISIONS
+# The number of possible steps a key press can last.
+DURATION_COUNT = SUBDIVISIONS
 
-META_TOKEN_COUNT = 1
-ADVANCE_TOKEN_COUNT = int(math.log2(SUBDIVISIONS)) + 1
-VELOCITY_TOKEN_COUNT = 16
-KEY_ON_TOKEN_COUNT = 88
-KEY_OFF_TOKEN_COUNT = 88
-PEDAL_TOKEN_COUNT = 2
+# Convert midi note to piano pitch.
+def midi_note_to_pitch(note: int) -> int:
+    pitch = note - 21
+    assert pitch >= 0 and pitch < PITCH_COUNT
+    return pitch
 
-ADVANCE_TOKEN_START = META_TOKEN_COUNT
-VELOCITY_TOKEN_START = ADVANCE_TOKEN_START + ADVANCE_TOKEN_COUNT
-KEY_ON_TOKEN_START = VELOCITY_TOKEN_START + VELOCITY_TOKEN_COUNT
-KEY_OFF_TOKEN_START = KEY_ON_TOKEN_START + KEY_ON_TOKEN_COUNT
-PEDAL_TOKEN_START = KEY_OFF_TOKEN_START + KEY_OFF_TOKEN_COUNT
+# Convert piano pitch to midi note.
+def pitch_to_midi_note(note: int) -> int:
+    return note + 21
 
-VOCAB_SIZE = PEDAL_TOKEN_START + PEDAL_TOKEN_COUNT
-
-TOKEN_NAMES = ['<next_track>'] \
-    + [f'advance_{pow(2, i)}' for i in range(ADVANCE_TOKEN_COUNT)] \
-    + [f'velocity_{i}' for i in range(VELOCITY_TOKEN_COUNT)] \
-    + [f'key_on_{i}' for i in range(KEY_ON_TOKEN_COUNT)] \
-    + [f'key_off_{i}' for i in range(KEY_OFF_TOKEN_COUNT)] \
-    + ['pedal_off', 'pedal_on']
-
-def midi_note_to_key(note: int) -> int:
-    return note - 21
-
-def key_to_midi_note(key: int) -> int:
-    return key + 21
-
+# Convert midi velocity to vocab velocity.
 def midi_velocity_to_velocity(velocity: int) -> int:
-    assert velocity < 128
-    return round(velocity / (128 // VELOCITY_TOKEN_COUNT))
+    return min(round(velocity / (128 // VELOCITY_COUNT)), VELOCITY_COUNT - 1)
 
+# Convert vocab velocty to midi velocity.
 def velocity_to_midi_velocity(velocity: int) -> int:
-    return velocity * (128 // VELOCITY_TOKEN_COUNT)
+    return velocity * (128 // VELOCITY_COUNT)
 
+# Intermediate representation of a token.
+@dataclass
+class Token:
+    start_tick: int
+    end_tick: int
+    pitch: int
+    velocity: int
 
 @dataclass
-class ParseState:
-    ticks_per_step: int
-    # The current step into the track, i.e. the number 32nd notes
-    # (or whatever the minimum subdivision is) into the track. May be slightly
-    # behind or ahead of tick.
-    step: int = 0
-    # The current tick into the track
-    tick: int = 0
-    # The velocity of the last key pressed.
-    velocity: int = 0
-    # True if the damper pedal is pressed, False otherwise.
-    pedal: bool = False
-    tokens = [1]
-    # Holds the fraction of a 32nd note each plaing key was offset by when
-    # pressed. This is an attempt to retain the duration of each note as much
-    # as possible.
-    quantize_bias = {}
+class ActiveKey:
+    start_tick: int
+    velocity: int
 
-    def advance_ticks(self, ticks: int, key: int | None = None, set_bias: bool = False):
-        self.tick += ticks
+# Parse midi track into a list of tokens.
+def parse_track(track) -> list[Token]:
+    active_keys: dict[int, ActiveKey] = {}
+    tick, tokens = 0, []
+    for event in track:
+        tick += event.time
+        if event.is_meta: continue
+        match event.type:
+            case 'note_on' if event.velocity != 0:
+                pitch = midi_note_to_pitch(event.note)
+                velocity = midi_velocity_to_velocity(event.velocity)
+                active_keys[pitch] = ActiveKey(start_tick=tick, velocity=velocity)
+            case 'note_off' | 'note_on':
+                pitch = midi_note_to_pitch(event.note)
+                try: active_key = active_keys.pop(pitch)
+                except KeyError: continue
+                tokens.append(Token(
+                    start_tick=active_key.start_tick,
+                    velocity=active_key.velocity,
+                    end_tick=tick,
+                    pitch=pitch,
+                ))
+            case _: continue
+    return tokens
 
-        bias = 0.0
-        if key is not None:
-            if key in self.quantize_bias and not set_bias:
-                bias = self.quantize_bias.pop(key)
+# Convert tokens to matrix representation.
+def tokens_to_data(tokens: list[Token], ticks_per_step: int) -> np.ndarray:
+    data = np.zeros((len(tokens), 4), dtype=np.int64)
+    step = 0
 
-        step = self.tick / self.ticks_per_step
-        quantized_step = round(step + bias)
+    for index, token in enumerate(tokens):
+        duration = (token.end_tick - token.start_tick) // ticks_per_step
 
-        if set_bias:
-            self.quantize_bias[key] = quantized_step - step
+        start_step = token.start_tick / ticks_per_step
+        quantized_start_step = round(start_step)
 
-        for subdivision in range(ADVANCE_TOKEN_COUNT - 1, -1, -1):
-            steps = pow(2, subdivision)
+        duration_bias = quantized_start_step - start_step
+        duration = min(round(duration + duration_bias), DURATION_COUNT - 1)
 
-            while quantized_step - self.step >= steps:
-                self.tokens.append(ADVANCE_TOKEN_START + subdivision)
-                self.step += steps
+        advance = min(start_step - step, ADVANCE_COUNT - 1)
+        step = max(step, start_step)
 
-    def key_on(self, key: int, velocity: int):
-        velocity = midi_velocity_to_velocity(velocity)
+        assert token.pitch < PITCH_COUNT
+        assert token.velocity < VELOCITY_COUNT
+        assert advance < ADVANCE_COUNT
+        assert duration < DURATION_COUNT
 
-        if self.velocity != velocity:
-            self.tokens.append(VELOCITY_TOKEN_START + velocity)
+        data[index, :] = np.array([token.pitch, token.velocity, advance, duration])
 
-        self.tokens.append(KEY_ON_TOKEN_START + key)
+    return data
 
-    def key_off(self, key: int):
-        self.tokens.append(KEY_OFF_TOKEN_START + key)
-
-    def set_pedal(self, pedal: bool):
-        if self.pedal != pedal:
-            self.tokens.append(PEDAL_TOKEN_START + pedal)
-            self.pedal = pedal
-
-
-def midi_to_tokens(file_path: str, transpose: int = 0) -> LongTensor:
-    """ Load a midi file and convert it to a tensor of tokens. """
-
+# If the file has multiple tracks, then they are concatinated.
+# All the tokens may be transposed as a form of data augmentation.
+def midi_to_tokens(file_path: str, transpose: int = 0) -> np.ndarray:
     midi = mido.MidiFile(file_path)
-    state = ParseState(ticks_per_step=midi.ticks_per_beat // (SUBDIVISIONS // 4))
 
-    min_key = 0
-    max_key = 87
+    # Assume that the song is in 4/4.
+    steps_per_beat = SUBDIVISIONS // 4
+    ticks_per_step=midi.ticks_per_beat // steps_per_beat
+
+    tracks = []
 
     for track in midi.tracks:
-        time_delta = 0
+        tokens = parse_track(track)
+        tokens.sort(key=lambda token: (token.start_tick, token.pitch))
+        tracks.append(tokens_to_data(tokens, ticks_per_step))
 
-        for event in track:
-            time_delta += event.time
+    data = np.vstack(tracks)
 
-            if event.is_meta:
-                continue
+    min_pitch, max_pitch = np.min(data[:, 0]), np.max(data[:, 0])
+    transpose = min(max(transpose, -min_pitch), PITCH_COUNT - max_pitch - 1)
 
-            match event.type:
-                case 'note_on':
-                    key = midi_note_to_key(event.note)
-                
-                    min_key = min(key, min_key)
-                    max_key = max(key, max_key)
+    data[:, 0] += transpose
 
-                    if event.velocity == 0:
-                        state.advance_ticks(time_delta, key); time_delta = 0
-                        state.key_off(key)
-                    else:
-                        state.advance_ticks(time_delta, key, set_bias=True); time_delta = 0
-                        state.key_on(key, event.velocity)
-                case 'note_off':
-                    key = midi_note_to_key(event.note)
-                    state.advance_ticks(time_delta, key); time_delta = 0
-                    state.key_off(key)
-                case 'control_change' if event.control == 64:
-                    state.advance_ticks(time_delta); time_delta = 0
-                    state.set_pedal(True if event.value >= 64 else False)
-                case _:
-                    continue
-    
-    transpose = max(transpose, -min_key)
-    transpose = min(transpose, 87 - max_key)
+    return data
 
-    if transpose != 0:
-        print(f"transposing by {transpose}")
-        for token in state.tokens:
-            if token in range(KEY_ON_TOKEN_START, PEDAL_TOKEN_START):
-                token += transpose
-
-    return LongTensor(state.tokens)
-
-def tokens_to_midi(file_path: str, tokens: LongTensor):
-    """ Converts a tensor of tokens into midi and saves to to a file """
-
+def tokens_to_midi(file_path: str, tokens: np.ndarray):
     midi = mido.MidiFile()
-
     midi.ticks_per_beat = 960
+
+    ticks_per_step = midi.ticks_per_beat // (SUBDIVISIONS // 4)
 
     meta_track = mido.MidiTrack()
     midi.tracks.append(meta_track)
@@ -179,45 +157,40 @@ def tokens_to_midi(file_path: str, tokens: LongTensor):
     track = mido.MidiTrack()
     midi.tracks.append(track)
 
-    time = 0
-    last_event_time = 0
-    velocity = 0
+    tick = 0
 
-    for token in tokens.tolist():
-        if token < ADVANCE_TOKEN_START:
-            continue
-        if token < VELOCITY_TOKEN_START:
-            time += pow(2, token - ADVANCE_TOKEN_START) \
-                * (midi.ticks_per_beat // (SUBDIVISIONS // 4))
-        elif token < KEY_ON_TOKEN_START:
-            velocity = velocity_to_midi_velocity(token - VELOCITY_TOKEN_START)
-        elif token < KEY_OFF_TOKEN_START:
-            note = key_to_midi_note(token - KEY_ON_TOKEN_START)
+    note_lift = {}
+
+    for row in tokens:
+        start = tick + row[2] * ticks_per_step
+
+        note_off_events = sorted(
+            iter((note, off_tick) for note, off_tick in note_lift.items() if off_tick < start),
+            key=lambda x: x[1],
+        )
+
+        for note, off_tick in note_off_events:
+            note_lift.pop(note)
             track.append(mido.Message(
-                type='note_on',
-                note=note,
-                velocity=velocity,
-                time=time - last_event_time,
+                type='note_off', note=note, velocity=64, time=off_tick - tick,
             ))
-            last_event_time = time
-        elif token < PEDAL_TOKEN_START:
-            track.append(mido.Message(
-                type='note_off',
-                note=key_to_midi_note(token - KEY_OFF_TOKEN_START),
-                velocity=64,
-                time=time - last_event_time,
-            ))
-            last_event_time = time
-        else:
-            track.append(mido.Message(
-                type='control_change',
-                control=64,
-                value=0 if token - PEDAL_TOKEN_START == 0 else 127,
-            ))
+            tick = off_tick
+
+        note = pitch_to_midi_note(row[0])
+        velocity = velocity_to_midi_velocity(row[1])
+        duration = row[3]
+
+        note_lift[note] = start + duration * ticks_per_step
+
+        track.append(mido.Message(
+            type='note_on', note=note, velocity=velocity, time=start - tick,
+        ))
+
+        tick = start
 
     midi.save(file_path)
 
 if __name__ == "__main__":
-    path = 'maestro-v3.0.0/2008/MIDI-Unprocessed_07_R1_2008_01-04_ORIG_MID--AUDIO_07_R1_2008_wav--1.midi'
+    path = 'maestro-v3.0.0-midi/2008/MIDI-Unprocessed_07_R1_2008_01-04_ORIG_MID--AUDIO_07_R1_2008_wav--1.midi'
     tokens = midi_to_tokens(path, -2)
     tokens_to_midi('out.midi', tokens)
